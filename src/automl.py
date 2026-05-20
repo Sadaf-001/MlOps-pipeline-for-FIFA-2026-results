@@ -30,21 +30,12 @@ setup(
     session_id=42
 )
 
+
 # Compare models automatically
 best_model = compare_models()
 
+# Save best model
+save_model(best_model, 'fifa_model')
 
-#save the best model
-from pycaret.classification import save_model
-
-save_model(best_model, 'models/fifa_model')
-import os
-
-print("FILES INSIDE MODELS FOLDER:")
-print(os.listdir("models"))
-
-
-print(best_model)
-print("MODEL SAVED")
-
+print("MODEL SAVED SUCCESSFULLY")
 
