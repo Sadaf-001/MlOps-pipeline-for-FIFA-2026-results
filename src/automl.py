@@ -39,4 +39,5 @@ from pycaret.classification import save_model
 
 save_model(best_model, 'models/fifa_model')
 
+
 print(best_model)
