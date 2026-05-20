@@ -39,5 +39,10 @@ from pycaret.classification import save_model
 
 save_model(best_model, 'models/fifa_model')
 
+import os
+
+print("FILES INSIDE MODELS FOLDER:")
+print(os.listdir("models"))
+
 
 print(best_model)
