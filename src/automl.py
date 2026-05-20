@@ -34,8 +34,10 @@ setup(
 # Compare models automatically
 best_model = compare_models()
 
-# Save best model
-save_model(best_model, 'fifa_model')
 
-print("MODEL SAVED SUCCESSFULLY")
+# Save model manually
+import joblib
 
+joblib.dump(best_model, "models/fifa_model.pkl")
+
+print("MODEL SAVED")
