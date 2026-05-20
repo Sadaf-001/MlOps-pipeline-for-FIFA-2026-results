@@ -33,4 +33,10 @@ setup(
 # Compare models automatically
 best_model = compare_models()
 
+
+#save the best model
+from pycaret.classification import save_model
+
+save_model(best_model, 'models/fifa_model')
+
 print(best_model)
