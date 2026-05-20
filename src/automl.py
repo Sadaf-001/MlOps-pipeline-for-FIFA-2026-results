@@ -37,7 +37,7 @@ best_model = compare_models()
 #save the best model
 from pycaret.classification import save_model
 
-save_model(best_model, './models/fifa_model')
+save_model(best_model, 'models/fifa_model')
 import os
 
 print("FILES INSIDE MODELS FOLDER:")
