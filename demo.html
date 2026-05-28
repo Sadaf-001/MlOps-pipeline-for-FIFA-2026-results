@@ -543,7 +543,42 @@ function updateDrift(val, featA, featB){
   document.getElementById('d-chi-sub').textContent = 'chi² p = '+chiP;
   document.getElementById('d-chi-sub').style.color = chiDrift?'var(--red)':'var(--green)';
 
-  const hw = Math.round(47-val*0.06), dr = Math.round(24+val*0.08), aw = Math.round(100-hw-dr);
+  // Scale shift by actual KS statistic so similar features show less drift
+  const shiftMag = swapActive ? Math.round(ksVal * 18) : 0;
+
+  // Direction of shift depends on which features are swapped:
+  // home/away form features → more away wins (home advantage erodes)
+  // goals features          → more draws (scoring becomes unpredictable)
+  // encoded/structural      → roughly equal shift to all classes
+  const fa = (featA||''), fb = (featB||'');
+  const isFormSwap  = (fa+fb).includes('win_rate') || (fa+fb).includes('streak');
+  const isGoalSwap  = (fa+fb).includes('goals') || (fa+fb).includes('goals_diff');
+  const isStructSwap= (fa+fb).includes('encoded') || (fa+fb).includes('neutral') || (fa+fb).includes('tournament');
+
+  let hwShift, drShift, awShift;
+  if (!swapActive) {
+    hwShift = 0; drShift = 0; awShift = 0;
+  } else if (isFormSwap) {
+    // Home advantage weakens → fewer home wins, more away wins
+    hwShift = -shiftMag;
+    awShift = +Math.round(shiftMag * 0.7);
+    drShift = shiftMag - Math.round(shiftMag * 0.7);
+  } else if (isGoalSwap) {
+    // Scoring patterns confused → more draws
+    drShift = +shiftMag;
+    hwShift = -Math.round(shiftMag * 0.6);
+    awShift = -Math.round(shiftMag * 0.4);
+  } else {
+    // Structural features swapped → all classes shift
+    hwShift = -Math.round(shiftMag * 0.5);
+    drShift = +Math.round(shiftMag * 0.3);
+    awShift = +Math.round(shiftMag * 0.2);
+  }
+
+  const hw = Math.max(5, Math.min(90, 47 + hwShift));
+  const dr = Math.max(5, Math.min(90, 24 + drShift));
+  const aw = Math.max(5, 100 - hw - dr);
+
   document.getElementById('hw-cur').textContent = '→ '+hw+'% (current)';
   document.getElementById('dr-cur').textContent = '→ '+dr+'% (current)';
   document.getElementById('aw-cur').textContent = '→ '+aw+'% (current)';
