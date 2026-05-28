@@ -156,63 +156,84 @@ def main():
     print(f"  Test snapshot saved → {args.test_snap}")
 
     # ── 5. Train ──────────────────────────────────────────────────────────────
-    print(f"\n[5/6] Training RandomForestClassifier (n_estimators={args.n_estimators}) …")
+    # ── Try PyCaret AutoML first, fall back to RandomForest ──────────────────
+    try:
+        from pycaret.classification import (
+            setup, compare_models, finalize_model, predict_model
+        )
+        from sklearn.metrics import f1_score
 
-    # Aggressively up-weight Draw and Away Win — they are severely under-predicted
-    class_weights = {"Home Win": 1.0, "Away Win": 2.0, "Draw": 4.0}
-    print(f"  Class weights: {class_weights}")
+        print(f"\n[5/6] Running PyCaret AutoML (this may take a few minutes) …")
+        train_pycaret = pd.concat([X_train, y_train], axis=1)
+        setup(data=train_pycaret, target="result",
+              session_id=args.random_state, verbose=False, fix_imbalance=True)
 
-    model = RandomForestClassifier(
-        n_estimators=args.n_estimators,
-        random_state=args.random_state,
-        n_jobs=-1,
-        class_weight=class_weights,
-    )
+        best  = compare_models(n_select=1, verbose=True)
+        model = finalize_model(best)
 
-    # Split train into train/val to find best draw threshold
-    from sklearn.model_selection import train_test_split as tts
-    from sklearn.metrics import f1_score
-    X_tr, X_val, y_tr, y_val = tts(
-        X_train, y_train, test_size=0.15, random_state=args.random_state
-    )
-    model.fit(X_tr, y_tr)
+        predictions = predict_model(model, data=X_test)
+        preds = predictions["prediction_label"].values
+        acc   = accuracy_score(y_test, preds)
+        print(f"\n  AutoML best model : {type(best).__name__}")
+        print(f"  Accuracy          : {acc:.4f}")
+        print(classification_report(y_test, preds))
+        joblib.dump(0.0, "models/draw_threshold.pkl")
 
-    classes   = list(model.classes_)
-    draw_idx  = classes.index("Draw")
+    except ImportError:
+        print(f"\n[5/6] PyCaret not found — training RandomForestClassifier …")
+        from sklearn.metrics import f1_score
 
-    def predict_with_threshold(proba, thresh):
-        preds = []
-        for row in proba:
-            if row[draw_idx] >= thresh:
-                preds.append("Draw")
-            else:
-                idx = max((v, i) for i, v in enumerate(row) if i != draw_idx)[1]
-                preds.append(classes[idx])
-        return preds
+        class_weights = {"Home Win": 1.0, "Away Win": 2.0, "Draw": 4.0}
+        print(f"  Class weights: {class_weights}")
 
-    best_f1, best_thresh = 0, 0.33
-    for thresh in [i / 100 for i in range(15, 45)]:
-        val_preds = predict_with_threshold(model.predict_proba(X_val), thresh)
-        f1 = f1_score(y_val, val_preds, average="macro", zero_division=0)
-        if f1 > best_f1:
-            best_f1, best_thresh = f1, thresh
+        model = RandomForestClassifier(
+            n_estimators=args.n_estimators,
+            random_state=args.random_state,
+            n_jobs=-1,
+            class_weight=class_weights,
+        )
 
-    print(f"  Best draw threshold: {best_thresh:.2f}  (val macro-F1={best_f1:.4f})")
-    joblib.dump(best_thresh, "models/draw_threshold.pkl")
+        from sklearn.model_selection import train_test_split as tts
+        X_tr, X_val, y_tr, y_val = tts(
+            X_train, y_train, test_size=0.15, random_state=args.random_state
+        )
+        model.fit(X_tr, y_tr)
 
-    # Retrain on full training set then evaluate with tuned threshold
-    model.fit(X_train, y_train)
-    preds = predict_with_threshold(model.predict_proba(X_test), best_thresh)
-    acc   = accuracy_score(y_test, preds)
-    print(f"\n  Accuracy : {acc:.4f}")
-    print(classification_report(y_test, preds))
+        classes  = list(model.classes_)
+        draw_idx = classes.index("Draw")
 
-    # Feature importance (top 10)
-    if has_ts:
-        importances = pd.Series(model.feature_importances_, index=feature_cols)
-        print("  Top 10 most important features:")
-        for feat, imp in importances.nlargest(10).items():
-            print(f"    {feat:<35s}  {imp:.4f}")
+        def predict_with_threshold(proba, thresh):
+            preds = []
+            for row in proba:
+                if row[draw_idx] >= thresh:
+                    preds.append("Draw")
+                else:
+                    idx = max((v, i) for i, v in enumerate(row) if i != draw_idx)[1]
+                    preds.append(classes[idx])
+            return preds
+
+        best_f1, best_thresh = 0, 0.33
+        for thresh in [i / 100 for i in range(15, 45)]:
+            val_preds = predict_with_threshold(model.predict_proba(X_val), thresh)
+            f1 = f1_score(y_val, val_preds, average="macro", zero_division=0)
+            if f1 > best_f1:
+                best_f1, best_thresh = f1, thresh
+
+        print(f"  Best draw threshold: {best_thresh:.2f}  (val macro-F1={best_f1:.4f})")
+        joblib.dump(best_thresh, "models/draw_threshold.pkl")
+
+        model.fit(X_train, y_train)
+        preds = predict_with_threshold(model.predict_proba(X_test), best_thresh)
+        acc   = accuracy_score(y_test, preds)
+        print(f"\n  Accuracy : {acc:.4f}")
+        print(classification_report(y_test, preds))
+
+        # Feature importance (top 10)
+        if has_ts:
+            importances = pd.Series(model.feature_importances_, index=feature_cols)
+            print("  Top 10 most important features:")
+            for feat, imp in importances.nlargest(10).items():
+                print(f"    {feat:<35s}  {imp:.4f}")
 
     # ── 6. Save ───────────────────────────────────────────────────────────────
     print("\n[6/6] Saving artefacts …")
