@@ -4,6 +4,6 @@ End-to-end MLOps pipeline for FIFA match outcome prediction using historical int
 
 Work Credit:
 
-Sadaf: EDA+Feature Engineering+AutoML
-Nick: Fine Tuning+Monitoring+Drift+Demo
+Sadaf: EDA+Feature Engineering+AutoML,
+Nick: Fine Tuning+Monitoring+Drift+Demo,
 Both: Pipeline
