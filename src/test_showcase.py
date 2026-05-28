@@ -90,6 +90,17 @@ def parse_args():
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
+def get_classes(model):
+    """Get string class labels — handles both sklearn and LightGBM models."""
+    if hasattr(model, 'str_classes_'):
+        return list(model.str_classes_)
+    classes = list(model.classes_)
+    if all(isinstance(c, (int, float)) for c in classes):
+        return ["Away Win", "Draw", "Home Win"]
+    return classes
+
+
+
 def main():
     args = parse_args()
 
@@ -124,20 +135,39 @@ def main():
 
     # ── Predictions ───────────────────────────────────────────────────────────
     print("\n[3/4] Running predictions …")
+    # Load target encoder to decode LightGBM numeric predictions
+    target_enc_path = "models/target_encoder.pkl"
+    target_enc = joblib.load(target_enc_path) if os.path.exists(target_enc_path) else None
+
+    def get_str_classes(model):
+        classes = list(model.classes_)
+        if all(isinstance(c, (int, float)) for c in classes):
+            return list(target_enc.classes_) if target_enc else ["Away Win", "Draw", "Home Win"]
+        return classes
+
+    def decode(model, raw):
+        str_cls = get_classes(model)
+        classes = list(model.classes_)
+        if all(isinstance(c, (int, float)) for c in classes):
+            return [str_cls[int(p)] for p in raw]
+        return [str(p) for p in raw]
+
     def predict(model, X, thresh):
-        if thresh is None:
-            return model.predict(X)
-        classes  = list(model.classes_)
-        draw_idx = classes.index("Draw")
-        proba    = model.predict_proba(X)
-        preds    = []
+        str_classes = get_classes(model)
+        draw_idx    = str_classes.index("Draw")
+        if thresh is None or thresh == 0:
+            return decode(model, model.predict(X))
+        proba = model.predict_proba(X)
+        preds = []
         for row in proba:
             if row[draw_idx] >= thresh:
                 preds.append("Draw")
             else:
                 idx = max((v, i) for i, v in enumerate(row) if i != draw_idx)[1]
-                preds.append(classes[idx])
+                preds.append(str_classes[idx])
         return preds
+
+    y = y.astype(str)
 
     base_preds = predict(base_model, X, draw_thresh)
     base_acc   = accuracy_score(y, base_preds)

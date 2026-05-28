@@ -14,7 +14,7 @@ import os
 
 import joblib
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
+import lightgbm as lgb
 from sklearn.metrics import accuracy_score, classification_report
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
@@ -156,90 +156,84 @@ def main():
     print(f"  Test snapshot saved → {args.test_snap}")
 
     # ── 5. Train ──────────────────────────────────────────────────────────────
-    # ── Try PyCaret AutoML first, fall back to RandomForest ──────────────────
-    try:
-        from pycaret.classification import (
-            setup, compare_models, finalize_model, predict_model
-        )
-        from sklearn.metrics import f1_score
+    # ── Train with LightGBM (selected via PyCaret AutoML) ────────────────────
+    # AutoML ran via automl.py and selected LightGBM as the best classifier.
+    print(f"\n[5/6] Training LightGBM classifier (AutoML winner) …")
+    from sklearn.metrics import f1_score
+    from sklearn.model_selection import train_test_split as tts
+    from sklearn.preprocessing import LabelEncoder as LE
 
-        print(f"\n[5/6] Running PyCaret AutoML (this may take a few minutes) …")
-        train_pycaret = pd.concat([X_train, y_train], axis=1)
-        setup(data=train_pycaret, target="result",
-              session_id=args.random_state, verbose=False, fix_imbalance=True)
+    # Encode target as integers — LightGBM requires numeric labels
+    le       = LE()
+    y_tr_enc = le.fit_transform(y_train)
+    y_te_enc = le.transform(y_test)
+    classes  = list(le.classes_)
+    draw_idx = classes.index("Draw")
 
-        best  = compare_models(n_select=1, verbose=True)
-        model = finalize_model(best)
+    model = lgb.LGBMClassifier(
+        n_estimators=args.n_estimators,
+        random_state=args.random_state,
+        n_jobs=-1,
+        verbose=-1,
+        num_leaves=31,
+        learning_rate=0.1,
+        min_child_samples=30,
+        subsample=0.8,
+        colsample_bytree=0.8,
+    )
 
-        predictions = predict_model(model, data=X_test)
-        preds = predictions["prediction_label"].values
-        acc   = accuracy_score(y_test, preds)
-        print(f"\n  AutoML best model : {type(best).__name__}")
-        print(f"  Accuracy          : {acc:.4f}")
-        print(classification_report(y_test, preds))
-        joblib.dump(0.0, "models/draw_threshold.pkl")
+    # Find best draw threshold on a validation split
+    X_tr, X_val, y_tr, y_val = tts(
+        X_train, y_tr_enc,
+        test_size=0.15, random_state=args.random_state
+    )
+    model.fit(X_tr, y_tr)
 
-    except ImportError:
-        print(f"\n[5/6] PyCaret not found — training RandomForestClassifier …")
-        from sklearn.metrics import f1_score
+    def predict_with_threshold(proba, thresh):
+        preds = []
+        for row in proba:
+            if row[draw_idx] >= thresh:
+                preds.append("Draw")
+            else:
+                idx = max((v, i) for i, v in enumerate(row) if i != draw_idx)[1]
+                preds.append(classes[idx])
+        return preds
 
-        class_weights = {"Home Win": 1.0, "Away Win": 2.0, "Draw": 4.0}
-        print(f"  Class weights: {class_weights}")
+    best_f1, best_thresh = 0, 0.33
+    for thresh in [i / 100 for i in range(15, 45)]:
+        val_preds  = predict_with_threshold(model.predict_proba(X_val), thresh)
+        val_labels = le.inverse_transform(y_val)
+        f1 = f1_score(val_labels, val_preds, average="macro", zero_division=0)
+        if f1 > best_f1:
+            best_f1, best_thresh = f1, thresh
 
-        model = RandomForestClassifier(
-            n_estimators=args.n_estimators,
-            random_state=args.random_state,
-            n_jobs=-1,
-            class_weight=class_weights,
-        )
+    print(f"  Best draw threshold: {best_thresh:.2f}  (val macro-F1={best_f1:.4f})")
+    joblib.dump(best_thresh, "models/draw_threshold.pkl")
 
-        from sklearn.model_selection import train_test_split as tts
-        X_tr, X_val, y_tr, y_val = tts(
-            X_train, y_train, test_size=0.15, random_state=args.random_state
-        )
-        model.fit(X_tr, y_tr)
+    # Retrain on full training set
+    model.fit(X_train, y_tr_enc)
 
-        classes  = list(model.classes_)
-        draw_idx = classes.index("Draw")
+    # Store string class labels as custom attribute for downstream scripts
+    model.str_classes_ = le.classes_
 
-        def predict_with_threshold(proba, thresh):
-            preds = []
-            for row in proba:
-                if row[draw_idx] >= thresh:
-                    preds.append("Draw")
-                else:
-                    idx = max((v, i) for i, v in enumerate(row) if i != draw_idx)[1]
-                    preds.append(classes[idx])
-            return preds
+    preds = predict_with_threshold(model.predict_proba(X_test), best_thresh)
+    acc   = accuracy_score(y_test, preds)
+    print(f"\n  Accuracy : {acc:.4f}")
+    print(classification_report(y_test, preds))
 
-        best_f1, best_thresh = 0, 0.33
-        for thresh in [i / 100 for i in range(15, 45)]:
-            val_preds = predict_with_threshold(model.predict_proba(X_val), thresh)
-            f1 = f1_score(y_val, val_preds, average="macro", zero_division=0)
-            if f1 > best_f1:
-                best_f1, best_thresh = f1, thresh
-
-        print(f"  Best draw threshold: {best_thresh:.2f}  (val macro-F1={best_f1:.4f})")
-        joblib.dump(best_thresh, "models/draw_threshold.pkl")
-
-        model.fit(X_train, y_train)
-        preds = predict_with_threshold(model.predict_proba(X_test), best_thresh)
-        acc   = accuracy_score(y_test, preds)
-        print(f"\n  Accuracy : {acc:.4f}")
-        print(classification_report(y_test, preds))
-
-        # Feature importance (top 10)
-        if has_ts:
-            importances = pd.Series(model.feature_importances_, index=feature_cols)
-            print("  Top 10 most important features:")
-            for feat, imp in importances.nlargest(10).items():
-                print(f"    {feat:<35s}  {imp:.4f}")
+    # Feature importance (top 10)
+    if has_ts:
+        importances = pd.Series(model.feature_importances_, index=feature_cols)
+        print("  Top 10 most important features:")
+        for feat, imp in importances.nlargest(10).items():
+            print(f"    {feat:<35s}  {imp:.4f}")
 
     # ── 6. Save ───────────────────────────────────────────────────────────────
     print("\n[6/6] Saving artefacts …")
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     joblib.dump(model,    args.output)
     joblib.dump(encoders, args.encoders)
+    joblib.dump(le,       "models/target_encoder.pkl")  # decode LightGBM numeric preds
 
     # Save feature column list so predict.py knows what to pass in
     joblib.dump(feature_cols, "models/feature_cols.pkl")

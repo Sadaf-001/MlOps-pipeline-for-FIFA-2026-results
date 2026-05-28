@@ -60,9 +60,10 @@ def encode_df(df: pd.DataFrame, encoders: dict) -> pd.DataFrame:
     return df
 
 
-FEATURE_COLS = [
+BASE_FEATURE_COLS = [
     "home_team_encoded", "away_team_encoded", "tournament_encoded", "neutral"
 ]
+FEATURE_COLS = BASE_FEATURE_COLS  # overridden below if feature_cols.pkl exists
 
 
 # ─── Drift tests ──────────────────────────────────────────────────────────────
@@ -240,6 +241,15 @@ def main():
     model    = joblib.load(args.model)
     encoders = joblib.load(args.encoders)
 
+    # Load feature cols saved by train.py / automl.py
+    feat_cols_path = "models/feature_cols.pkl"
+    if os.path.exists(feat_cols_path):
+        global FEATURE_COLS
+        FEATURE_COLS = joblib.load(feat_cols_path)
+        print(f"  Feature cols loaded: {len(FEATURE_COLS)} columns")
+    else:
+        print("  ⚠️  feature_cols.pkl not found — using base 4 features")
+
     print("[2/5] Loading reference data …")
     ref_df = pd.read_csv(args.reference)
     ref_df["result"] = ref_df.apply(get_result, axis=1)
@@ -257,8 +267,21 @@ def main():
     y_ref = ref_df["result"]
     y_cur = cur_df["result"]
 
-    ref_preds = model.predict(X_ref)
-    cur_preds = model.predict(X_cur)
+    def safe_predict(m, X):
+        """Handle both sklearn and PyCaret pipeline models."""
+        try:
+            return m.predict(X)
+        except Exception:
+            # PyCaret pipeline may need the target column dropped differently
+            try:
+                from pycaret.classification import predict_model
+                result = predict_model(m, data=X)
+                return result["prediction_label"].values
+            except Exception as e2:
+                raise RuntimeError(f"Could not predict with model: {e2}")
+
+    ref_preds = safe_predict(model, X_ref)
+    cur_preds = safe_predict(model, X_cur)
 
     ref_acc = accuracy_score(y_ref, ref_preds)
     cur_acc = accuracy_score(y_cur, cur_preds)

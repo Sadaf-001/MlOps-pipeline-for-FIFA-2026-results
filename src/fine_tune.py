@@ -1,6 +1,6 @@
 """
-fine_tune.py  (v2 — supports time-series features)
-===================================================
+fine_tune.py  (v3 — LightGBM compatible)
+=========================================
 Fine-tune a previously saved FIFA match prediction model on new data.
 
 Usage:
@@ -54,22 +54,61 @@ def encode_new_data(df: pd.DataFrame, encoders: dict) -> pd.DataFrame:
 def prepare_features(df: pd.DataFrame, feature_cols: list) -> tuple:
     missing = [c for c in feature_cols if c not in df.columns]
     if missing:
-        raise ValueError(
-            f"Dataset is missing {len(missing)} expected feature columns: {missing}\n"
-            f"Make sure you are passing the engineered CSV "
-            f"(data/results_engineered.csv), not the raw results.csv."
-        )
+        raise ValueError(f"Dataset missing {len(missing)} feature columns: {missing}")
     return df[feature_cols], df["result"]
 
 
-# ─── Core fine-tuning ─────────────────────────────────────────────────────────
+def get_classes(model):
+    """Get string class labels — handles both sklearn and LightGBM models."""
+    if hasattr(model, 'str_classes_'):
+        return list(model.str_classes_)
+    classes = list(model.classes_)
+    if all(isinstance(c, (int, float)) for c in classes):
+        return ["Away Win", "Draw", "Home Win"]
+    return classes
 
-def warm_start_finetune(
-    base_model: RandomForestClassifier,
-    X_new: pd.DataFrame,
-    y_new: pd.Series,
-    n_new_estimators: int = 50,
-) -> RandomForestClassifier:
+
+def evaluate(model, X_test, y_test, label: str,
+             draw_threshold: float = None) -> dict:
+    str_classes = get_classes(model)
+    draw_idx    = str_classes.index("Draw")
+
+    def decode(raw):
+        classes = list(model.classes_)
+        if all(isinstance(c, (int, float)) for c in classes):
+            return [str_classes[int(p)] for p in raw]
+        return [str(p) for p in raw]
+
+    if draw_threshold is not None and draw_threshold > 0:
+        proba = model.predict_proba(X_test)
+        preds = []
+        for row in proba:
+            if row[draw_idx] >= draw_threshold:
+                preds.append("Draw")
+            else:
+                idx = max((v, i) for i, v in enumerate(row) if i != draw_idx)[1]
+                preds.append(str_classes[idx])
+    else:
+        preds = decode(model.predict(X_test))
+
+    y_str  = [str(v) for v in y_test]
+    acc    = accuracy_score(y_str, preds)
+    report = classification_report(y_str, preds, output_dict=True, zero_division=0)
+    print(f"\n── {label} ──")
+    print(f"  Accuracy : {acc:.4f}")
+    print(classification_report(y_str, preds, zero_division=0))
+    return {"accuracy": acc, "report": report}
+
+
+def warm_start_finetune(base_model, X_new, y_new, n_new_estimators=50):
+    """Add new trees to existing forest via warm-start."""
+    # Only works for RandomForest — for LightGBM we retrain
+    if not isinstance(base_model, RandomForestClassifier):
+        print("  ⚠️  Warm-start only supported for RandomForest.")
+        print("     For LightGBM, retraining on combined data instead.")
+        base_model.fit(X_new, y_new)
+        return base_model
+
     base_n    = base_model.n_estimators
     new_total = base_n + n_new_estimators
 
@@ -83,7 +122,6 @@ def warm_start_finetune(
     fine_tuned.n_classes_     = base_model.n_classes_
     fine_tuned.n_outputs_     = base_model.n_outputs_
     fine_tuned.n_features_in_ = base_model.n_features_in_
-
     fine_tuned.set_params(n_estimators=new_total)
     fine_tuned.fit(X_new, y_new)
 
@@ -91,41 +129,15 @@ def warm_start_finetune(
     return fine_tuned
 
 
-# ─── Evaluation ───────────────────────────────────────────────────────────────
-
-def evaluate(model, X_test, y_test, label: str,
-             draw_threshold: float = None) -> dict:
-    if draw_threshold is not None:
-        classes  = list(model.classes_)
-        draw_idx = classes.index("Draw")
-        proba    = model.predict_proba(X_test)
-        preds    = []
-        for row in proba:
-            if row[draw_idx] >= draw_threshold:
-                preds.append("Draw")
-            else:
-                idx = max((v, i) for i, v in enumerate(row) if i != draw_idx)[1]
-                preds.append(classes[idx])
-    else:
-        preds = model.predict(X_test)
-
-    acc    = accuracy_score(y_test, preds)
-    report = classification_report(y_test, preds, output_dict=True)
-    print(f"\n── {label} ──")
-    print(f"  Accuracy : {acc:.4f}")
-    print(classification_report(y_test, preds))
-    return {"accuracy": acc, "report": report}
-
-
 def log_run(log_path, base_acc, ft_acc, n_new_rows, n_new_estimators, output_path):
     entry = {
-        "timestamp":         datetime.utcnow().isoformat(),
-        "n_new_rows":        n_new_rows,
-        "n_new_estimators":  n_new_estimators,
-        "base_accuracy":     round(base_acc, 4),
-        "finetuned_accuracy":round(ft_acc,   4),
-        "delta":             round(ft_acc - base_acc, 4),
-        "output_model":      output_path,
+        "timestamp":          datetime.utcnow().isoformat(),
+        "n_new_rows":         n_new_rows,
+        "n_new_estimators":   n_new_estimators,
+        "base_accuracy":      round(base_acc, 4),
+        "finetuned_accuracy": round(ft_acc,   4),
+        "delta":              round(ft_acc - base_acc, 4),
+        "output_model":       output_path,
     }
     os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
     history = []
@@ -158,7 +170,6 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # ── 1. Load artefacts ─────────────────────────────────────────────────────
     print(f"\n[1/5] Loading artefacts …")
     base_model   = joblib.load(args.base_model)
     encoders     = load_encoders(args.encoders)
@@ -169,43 +180,33 @@ def main():
     if draw_thresh:
         print(f"  Draw threshold loaded: {draw_thresh:.2f}")
 
-    # ── 2. Load & prepare new data ────────────────────────────────────────────
     print(f"\n[2/5] Loading new data from '{args.new_data}' …")
     df = pd.read_csv(args.new_data)
     df["result"] = df.apply(get_result, axis=1)
-
-    # Fix neutral column if it's still strings
     if df["neutral"].dtype == object:
         df["neutral"] = df["neutral"].str.upper().map({"TRUE": 1, "FALSE": 0})
-
     df = encode_new_data(df, encoders)
     print(f"  {len(df)} rows | {df['result'].value_counts().to_dict()}")
 
-    # ── 3. Build feature matrix ───────────────────────────────────────────────
     print("\n[3/5] Preparing features …")
     if feature_cols is None:
         feature_cols = ["home_team_encoded", "away_team_encoded",
                         "tournament_encoded", "neutral"]
-        print("  ⚠️  No feature_cols.pkl found — using base 4 features only")
-
-    # Sort chronologically to avoid leakage — same as train.py
-    if "date" in df.columns:
-        df = df.sort_values("date").reset_index(drop=True)
-
     X, y = prepare_features(df, feature_cols)
 
-    # Time-based split: train on oldest 80%, test on most recent 20%
+    # Time-based split
+    if "date" in df.columns:
+        df = df.sort_values("date").reset_index(drop=True)
+        X, y = prepare_features(df, feature_cols)
     split_idx = int(len(df) * (1 - args.test_size))
     X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
     y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
 
-    # ── 4. Baseline evaluation ────────────────────────────────────────────────
     print("\n[4/5] Evaluating base model on new test split …")
     base_metrics = evaluate(base_model, X_test, y_test,
                             "BASE MODEL", draw_threshold=draw_thresh)
 
-    # ── 5. Fine-tune & evaluate ───────────────────────────────────────────────
-    print(f"\n[5/5] Fine-tuning (+{args.n_estimators} trees via warm-start) …")
+    print(f"\n[5/5] Fine-tuning (+{args.n_estimators} trees) …")
     ft_model = warm_start_finetune(base_model, X_train, y_train, args.n_estimators)
     ft_metrics = evaluate(ft_model, X_test, y_test,
                           "FINE-TUNED MODEL", draw_threshold=draw_thresh)
@@ -213,7 +214,6 @@ def main():
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     joblib.dump(ft_model, args.output)
     print(f"\n  Fine-tuned model saved → {args.output}")
-
     log_run(args.log, base_metrics["accuracy"], ft_metrics["accuracy"],
             len(df), args.n_estimators, args.output)
 
