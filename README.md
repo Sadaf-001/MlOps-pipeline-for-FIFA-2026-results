@@ -7,3 +7,5 @@ Work Credit:
 Sadaf: EDA+Feature Engineering+AutoML,
 Nick: Fine Tuning+Monitoring+Drift+Demo,
 Both: Pipeline
+
+Kai: Presenting slides 1-3, late entry
