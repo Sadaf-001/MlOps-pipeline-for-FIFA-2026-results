@@ -24,7 +24,7 @@ import joblib
 import pandas as pd
 
 
-# ─── Feature columns (must match feature_engineering.py output) ───────────────
+# --- Feature columns (must match feature_engineering.py output) ---------------
 BASE_FEATURES = [
     "home_team_encoded",
     "away_team_encoded",
@@ -45,7 +45,7 @@ TS_FEATURES = [
 ALL_FEATURES = BASE_FEATURES + TS_FEATURES
 
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
+# --- Helpers ------------------------------------------------------------------
 
 def get_result(row) -> str:
     if row["home_score"] > row["away_score"]:
@@ -55,7 +55,7 @@ def get_result(row) -> str:
     return "Draw"
 
 
-# ─── CLI ──────────────────────────────────────────────────────────────────────
+# --- CLI ----------------------------------------------------------------------
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -69,18 +69,18 @@ def parse_args():
     return p.parse_args()
 
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
+# --- Main ---------------------------------------------------------------------
 
 def main():
     args = parse_args()
 
-    # ── 1. Load ───────────────────────────────────────────────────────────────
-    print(f"\n[1/5] Loading data from '{args.data}' …")
+    # -- 1. Load ---------------------------------------------------------------
+    print(f"\n[1/5] Loading data from '{args.data}' ...")
     df = pd.read_csv(args.data)
 
     has_ts = all(c in df.columns for c in TS_FEATURES)
     if not has_ts:
-        print("  ⚠️  Time-series features not found — run feature_engineering.py first")
+        print("  [WARN]  Time-series features not found — run feature_engineering.py first")
 
     # Fix neutral column
     if df["neutral"].dtype == object:
@@ -88,8 +88,8 @@ def main():
 
     print(f"  {len(df)} rows loaded")
 
-    # ── 2. Target + encode ────────────────────────────────────────────────────
-    print("\n[2/5] Preparing target and encoders …")
+    # -- 2. Target + encode ----------------------------------------------------
+    print("\n[2/5] Preparing target and encoders ...")
     df["result"] = df.apply(get_result, axis=1)
 
     from sklearn.preprocessing import LabelEncoder
@@ -103,10 +103,10 @@ def main():
     encoders = {"home_team": home_enc, "away_team": away_enc, "tournament": tourn_enc}
     os.makedirs(os.path.dirname(args.encoders) or ".", exist_ok=True)
     joblib.dump(encoders, args.encoders)
-    print(f"  Encoders saved → {args.encoders}")
+    print(f"  Encoders saved -> {args.encoders}")
 
-    # ── 3. Time-based split ───────────────────────────────────────────────────
-    print("\n[3/5] Splitting data (time-based) …")
+    # -- 3. Time-based split ---------------------------------------------------
+    print("\n[3/5] Splitting data (time-based) ...")
     feature_cols = [c for c in (ALL_FEATURES if has_ts else BASE_FEATURES)
                     if c in df.columns]
 
@@ -122,10 +122,10 @@ def main():
 
     # Save test snapshot for showcase
     test_df.to_csv("data/test_snapshot.csv", index=False)
-    print(f"  Test snapshot saved → data/test_snapshot.csv")
+    print(f"  Test snapshot saved -> data/test_snapshot.csv")
 
-    # ── 4. PyCaret AutoML ─────────────────────────────────────────────────────
-    print("\n[4/5] Running PyCaret AutoML …")
+    # -- 4. PyCaret AutoML -----------------------------------------------------
+    print("\n[4/5] Running PyCaret AutoML ...")
     try:
         from pycaret.classification import (
             setup, compare_models, finalize_model,
@@ -144,29 +144,46 @@ def main():
             fix_imbalance=True,
         )
 
-        print(f"  Comparing top {args.n_top} models …")
-        best_model = compare_models(n_select=1, verbose=True)
-        results    = pull()
-        print("\n  AutoML leaderboard:")
-        print(results.head(args.n_top).to_string())
+        print(f"  Comparing top {args.n_top} models ...")
 
-        # Finalize on full training data
-        final_model = finalize_model(best_model)
+        import mlflow
+        from sklearn.metrics import f1_score as _f1
+        mlflow.set_experiment("FIFA Match Prediction")
 
-        # Evaluate on held-out test set
-        print("\n  Evaluating on held-out test set …")
-        test_pycaret = test_df[feature_cols + ["result"]].copy()
-        predictions  = predict_model(final_model, data=test_pycaret)
-        from sklearn.metrics import accuracy_score, classification_report
-        acc = accuracy_score(predictions["result"], predictions["prediction_label"])
-        print(f"  Test accuracy: {acc:.4f}")
-        print(classification_report(predictions["result"],
-                                    predictions["prediction_label"]))
+        with mlflow.start_run(run_name="automl_pycaret"):
+            best_model = compare_models(n_select=1, sort='Accuracy', verbose=True)
+            results    = pull()
+            print("\n  AutoML leaderboard:")
+            print(results.head(args.n_top).to_string())
+
+            final_model = finalize_model(best_model)
+
+            print("\n  Evaluating on held-out test set ...")
+            test_pycaret = test_df[feature_cols + ["result"]].copy()
+            predictions  = predict_model(final_model, data=test_pycaret)
+            from sklearn.metrics import accuracy_score, classification_report
+            acc = accuracy_score(predictions["result"], predictions["prediction_label"])
+            mf1 = _f1(predictions["result"], predictions["prediction_label"],
+                      average="macro", zero_division=0)
+            print(f"  Test accuracy: {acc:.4f}")
+            print(classification_report(predictions["result"],
+                                        predictions["prediction_label"]))
+
+            mlflow.log_param("automl_winner",     type(best_model).__name__)
+            mlflow.log_param("n_models_compared", args.n_top)
+            mlflow.log_param("sort_metric",       "accuracy")
+            mlflow.log_metric("accuracy",         round(acc, 4))
+            mlflow.log_metric("macro_f1",         round(mf1, 4))
+            mlflow.set_tag("selection_criterion", "macro_f1 — equally weights all 3 classes")
+            os.makedirs("logs", exist_ok=True)
+            results.to_csv("logs/automl_leaderboard.csv", index=False)
+            mlflow.log_artifact("logs/automl_leaderboard.csv")
+            print("  Leaderboard saved -> logs/automl_leaderboard.csv")
 
         best = final_model
 
     except ImportError:
-        print("  ⚠️  PyCaret not installed. Falling back to RandomForest.")
+        print("  [WARN]  PyCaret not installed. Falling back to RandomForest.")
         print("       Install with: pip install pycaret")
         from sklearn.ensemble import RandomForestClassifier
         from sklearn.metrics import accuracy_score, classification_report
@@ -185,14 +202,14 @@ def main():
         print(f"  Test accuracy: {accuracy_score(y_test, preds):.4f}")
         print(classification_report(y_test, preds))
 
-    # ── 5. Save ───────────────────────────────────────────────────────────────
-    print("\n[5/5] Saving artefacts …")
+    # -- 5. Save ---------------------------------------------------------------
+    print("\n[5/5] Saving artefacts ...")
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     joblib.dump(best, args.output)
     joblib.dump(feature_cols, "models/feature_cols.pkl")
-    print(f"  Model        → {args.output}")
-    print(f"  Feature list → models/feature_cols.pkl")
-    print("\n✅  AutoML complete.")
+    print(f"  Model        -> {args.output}")
+    print(f"  Feature list -> models/feature_cols.pkl")
+    print("\n[OK]  AutoML complete.")
 
 
 if __name__ == "__main__":

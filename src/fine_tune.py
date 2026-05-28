@@ -1,8 +1,8 @@
 """
-fine_tune.py  (v4 — LightGBM + MLflow tracking)
-=================================================
+fine_tune.py  (v5 - Ridge + MLflow)
+=====================================
 Fine-tune the FIFA match prediction model on new data.
-All runs tracked with MLflow.
+Handles both Ridge (decision_function) and LightGBM (predict_proba).
 
 Usage:
     python src/fine_tune.py \
@@ -23,7 +23,7 @@ from sklearn.metrics import accuracy_score, classification_report, f1_score
 from sklearn.model_selection import train_test_split
 
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
+# ---- Helpers -----------------------------------------------------------------
 
 def get_result(row) -> str:
     if row["home_score"] > row["away_score"]:
@@ -52,54 +52,65 @@ def encode_new_data(df, encoders):
 
 
 def get_classes(model):
+    """Get string class labels for any model type."""
     if hasattr(model, 'str_classes_'):
         return list(model.str_classes_)
     classes = list(model.classes_)
     if all(isinstance(c, (int, float)) for c in classes):
         return ["Away Win", "Draw", "Home Win"]
-    return classes
+    return [str(c) for c in classes]
+
+
+def predict_with_threshold(model, X, thresh):
+    """Works for both Ridge (decision_function) and LightGBM (predict_proba)."""
+    classes  = get_classes(model)
+    draw_idx = classes.index("Draw")
+
+    # Ridge uses decision_function; others use predict_proba
+    if hasattr(model, 'decision_function') and not hasattr(model, 'predict_proba'):
+        scores = model.decision_function(X)
+    elif hasattr(model, 'predict_proba'):
+        scores = model.predict_proba(X)
+        # For LightGBM with numeric classes, map back to strings
+        raw_classes = list(model.classes_)
+        if all(isinstance(c, (int, float)) for c in raw_classes):
+            # scores already in right order, just need string classes
+            pass
+    else:
+        return [str(p) for p in model.predict(X)]
+
+    preds = []
+    for row in scores:
+        if thresh is not None and row[draw_idx] >= thresh:
+            preds.append("Draw")
+        else:
+            idx = max((v, i) for i, v in enumerate(row) if i != draw_idx)[1]
+            preds.append(classes[idx])
+    return preds
 
 
 def evaluate(model, X_test, y_test, label, draw_threshold=None):
-    str_classes = get_classes(model)
-    draw_idx    = str_classes.index("Draw")
-
-    def decode(raw):
-        classes = list(model.classes_)
-        if all(isinstance(c, (int, float)) for c in classes):
-            return [str_classes[int(p)] for p in raw]
-        return [str(p) for p in raw]
-
-    if draw_threshold is not None and draw_threshold > 0:
-        proba = model.predict_proba(X_test)
-        preds = []
-        for row in proba:
-            if row[draw_idx] >= draw_threshold:
-                preds.append("Draw")
-            else:
-                idx = max((v, i) for i, v in enumerate(row) if i != draw_idx)[1]
-                preds.append(str_classes[idx])
-    else:
-        preds = decode(model.predict(X_test))
-
+    preds  = predict_with_threshold(model, X_test, draw_threshold)
     y_str  = [str(v) for v in y_test]
     acc    = accuracy_score(y_str, preds)
     mf1    = f1_score(y_str, preds, average="macro", zero_division=0)
     report = classification_report(y_str, preds, output_dict=True, zero_division=0)
-    print(f"\n── {label} ──")
-    print(f"  Accuracy : {acc:.4f}")
+    print(f"\n-- {label} --")
+    print(f"  Accuracy : {acc:.4f}  |  Macro F1 : {mf1:.4f}")
     print(classification_report(y_str, preds, zero_division=0))
     return {"accuracy": acc, "macro_f1": mf1, "report": report}
 
 
-def log_run(log_path, base_acc, ft_acc, n_new_rows, n_new_estimators, output_path):
+def log_run(log_path, base_acc, ft_acc, base_f1, ft_f1, n_new_rows, output_path):
     entry = {
         "timestamp":          datetime.utcnow().isoformat(),
         "n_new_rows":         n_new_rows,
-        "n_new_estimators":   n_new_estimators,
         "base_accuracy":      round(base_acc, 4),
         "finetuned_accuracy": round(ft_acc,   4),
-        "delta":              round(ft_acc - base_acc, 4),
+        "acc_delta":          round(ft_acc - base_acc, 4),
+        "base_macro_f1":      round(base_f1,  4),
+        "finetuned_macro_f1": round(ft_f1,    4),
+        "f1_delta":           round(ft_f1 - base_f1, 4),
         "output_model":       output_path,
     }
     os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
@@ -110,11 +121,12 @@ def log_run(log_path, base_acc, ft_acc, n_new_rows, n_new_estimators, output_pat
     history.append(entry)
     with open(log_path, "w") as f:
         json.dump(history, f, indent=2)
-    print(f"\n  Run logged → {log_path}")
-    print(f"  Δ accuracy : {entry['delta']:+.4f}")
+    print(f"\n  Run logged -> {log_path}")
+    print(f"  Acc delta  : {entry['acc_delta']:+.4f}")
+    print(f"  F1 delta   : {entry['f1_delta']:+.4f}")
 
 
-# ─── CLI ──────────────────────────────────────────────────────────────────────
+# ---- CLI ---------------------------------------------------------------------
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -124,7 +136,6 @@ def parse_args():
     p.add_argument("--feature-cols", default="models/feature_cols.pkl")
     p.add_argument("--draw-thresh",  default="models/draw_threshold.pkl")
     p.add_argument("--output",       default="models/fifa_model_finetuned.pkl")
-    p.add_argument("--n-estimators", type=int, default=50)
     p.add_argument("--test-size",    type=float, default=0.2)
     p.add_argument("--log",          default="logs/finetune_log.json")
     p.add_argument("--experiment",   default="FIFA Match Prediction")
@@ -138,17 +149,19 @@ def main():
 
     with mlflow.start_run(run_name="fine_tune"):
 
-        print(f"\n[1/5] Loading artefacts …")
+        print(f"\n[1/5] Loading artefacts ...")
         base_model   = joblib.load(args.base_model)
         encoders     = load_encoders(args.encoders)
         feature_cols = joblib.load(args.feature_cols) if os.path.exists(args.feature_cols) else None
         draw_thresh  = joblib.load(args.draw_thresh)  if os.path.exists(args.draw_thresh)  else None
+        model_type   = joblib.load("models/model_type.pkl") if os.path.exists("models/model_type.pkl") else "unknown"
+        print(f"  Model type    : {model_type}")
         if feature_cols:
-            print(f"  Feature cols loaded: {len(feature_cols)} columns")
-        if draw_thresh:
-            print(f"  Draw threshold loaded: {draw_thresh:.2f}")
+            print(f"  Feature cols  : {len(feature_cols)} columns")
+        if draw_thresh is not None:
+            print(f"  Draw threshold: {draw_thresh}")
 
-        print(f"\n[2/5] Loading new data from '{args.new_data}' …")
+        print(f"\n[2/5] Loading new data from '{args.new_data}' ...")
         df = pd.read_csv(args.new_data)
         df["result"] = df.apply(get_result, axis=1)
         if df["neutral"].dtype == object:
@@ -156,11 +169,10 @@ def main():
         df = encode_new_data(df, encoders)
         print(f"  {len(df)} rows | {df['result'].value_counts().to_dict()}")
 
-        print("\n[3/5] Preparing features …")
+        print("\n[3/5] Preparing features ...")
         if feature_cols is None:
             feature_cols = ["home_team_encoded", "away_team_encoded",
                             "tournament_encoded", "neutral"]
-
         if "date" in df.columns:
             df = df.sort_values("date").reset_index(drop=True)
 
@@ -170,60 +182,40 @@ def main():
         X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
         y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
 
-        print("\n[4/5] Evaluating base model on new test split …")
+        print("\n[4/5] Evaluating base model ...")
         base_metrics = evaluate(base_model, X_test, y_test,
                                 "BASE MODEL", draw_threshold=draw_thresh)
 
-        print(f"\n[5/5] Fine-tuning …")
-        from sklearn.ensemble import RandomForestClassifier
-        if isinstance(base_model, RandomForestClassifier):
-            base_n    = base_model.n_estimators
-            new_total = base_n + args.n_estimators
-            params = base_model.get_params()
-            params["n_estimators"] = base_n
-            params["warm_start"]   = True
-            from sklearn.ensemble import RandomForestClassifier as RFC
-            ft_model = RFC(**params)
-            ft_model.estimators_    = base_model.estimators_
-            ft_model.classes_       = base_model.classes_
-            ft_model.n_classes_     = base_model.n_classes_
-            ft_model.n_outputs_     = base_model.n_outputs_
-            ft_model.n_features_in_ = base_model.n_features_in_
-            ft_model.set_params(n_estimators=new_total)
-            ft_model.fit(X_train, y_train)
-            print(f"  Warm-start: {base_n} + {args.n_estimators} = {new_total} trees")
-        else:
-            print("  LightGBM: retraining on new data …")
-            ft_model = base_model
-            from sklearn.preprocessing import LabelEncoder
-            le = joblib.load("models/target_encoder.pkl") if os.path.exists("models/target_encoder.pkl") else LabelEncoder().fit(y_train)
-            y_enc = le.transform(y_train)
-            ft_model.fit(X_train, y_enc)
-
+        print(f"\n[5/5] Fine-tuning ...")
+        import copy
+        ft_model = copy.deepcopy(base_model)
+        ft_model.fit(X_train, y_train)
         ft_metrics = evaluate(ft_model, X_test, y_test,
                               "FINE-TUNED MODEL", draw_threshold=draw_thresh)
 
-        # MLflow logging
         mlflow.log_params({
-            "n_new_rows":      len(df),
-            "n_new_estimators": args.n_estimators,
-            "draw_threshold":  draw_thresh,
+            "model_type":    model_type,
+            "n_new_rows":    len(df),
+            "draw_threshold": draw_thresh,
         })
         mlflow.log_metrics({
             "base_accuracy":      round(base_metrics["accuracy"], 4),
             "finetuned_accuracy": round(ft_metrics["accuracy"],   4),
-            "delta":              round(ft_metrics["accuracy"] - base_metrics["accuracy"], 4),
+            "acc_delta":          round(ft_metrics["accuracy"] - base_metrics["accuracy"], 4),
             "base_macro_f1":      round(base_metrics["macro_f1"], 4),
             "finetuned_macro_f1": round(ft_metrics["macro_f1"],   4),
+            "f1_delta":           round(ft_metrics["macro_f1"] - base_metrics["macro_f1"], 4),
         })
 
         os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
         joblib.dump(ft_model, args.output)
         mlflow.log_artifact(args.output)
-        print(f"\n  Fine-tuned model saved → {args.output}")
+        print(f"\n  Fine-tuned model saved -> {args.output}")
 
-        log_run(args.log, base_metrics["accuracy"], ft_metrics["accuracy"],
-                len(df), args.n_estimators, args.output)
+        log_run(args.log,
+                base_metrics["accuracy"], ft_metrics["accuracy"],
+                base_metrics["macro_f1"], ft_metrics["macro_f1"],
+                len(df), args.output)
 
 
 if __name__ == "__main__":

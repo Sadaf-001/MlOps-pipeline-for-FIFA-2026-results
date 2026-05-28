@@ -1,8 +1,8 @@
 """
-train.py  (v3 — LightGBM + MLflow tracking)
+train.py  (v5 - LightGBM + MLflow tracking)
 =============================================
 Trains a LightGBM classifier on FIFA historical results using engineered
-time-series features. All runs are tracked with MLflow.
+time-series features. LightGBM was selected by PyCaret AutoML.
 
 Run order:
     python src/feature_engineering.py
@@ -20,13 +20,13 @@ import joblib
 import mlflow
 import mlflow.sklearn
 import pandas as pd
+import lightgbm as lgb
 from sklearn.metrics import accuracy_score, classification_report, f1_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
-import lightgbm as lgb
 
 
-# ─── Feature columns ──────────────────────────────────────────────────────────
+# ---- Feature columns ---------------------------------------------------------
 BASE_FEATURES = [
     "home_team_encoded", "away_team_encoded", "tournament_encoded", "neutral",
 ]
@@ -44,7 +44,7 @@ TS_FEATURES = [
 ALL_FEATURES = BASE_FEATURES + TS_FEATURES
 
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
+# ---- Helpers -----------------------------------------------------------------
 
 def get_result(row) -> str:
     if row["home_score"] > row["away_score"]:
@@ -54,7 +54,7 @@ def get_result(row) -> str:
     return "Draw"
 
 
-# ─── CLI ──────────────────────────────────────────────────────────────────────
+# ---- CLI ---------------------------------------------------------------------
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -69,45 +69,45 @@ def parse_args():
     return p.parse_args()
 
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
+# ---- Main --------------------------------------------------------------------
 
 def main():
     args = parse_args()
 
-    # ── MLflow setup ──────────────────────────────────────────────────────────
     mlflow.set_experiment(args.experiment)
 
     with mlflow.start_run(run_name="lgbm_train"):
 
-        # ── 1. Load ───────────────────────────────────────────────────────────
-        print(f"\n[1/6] Loading data from '{args.data}' …")
+        # 1. Load
+        print(f"\n[1/6] Loading data from '{args.data}' ...")
         data_path = args.data if os.path.exists(args.data) else "data/results.csv"
         df = pd.read_csv(data_path)
         print(f"  Shape : {df.shape}")
 
         has_ts = all(c in df.columns for c in TS_FEATURES)
-        if has_ts:
-            print(f"  ✅  Time-series features detected ({len(TS_FEATURES)} columns)")
-        else:
-            print("  ⚠️   Time-series features not found — using base features only")
+        print(f"  Time-series features: {'yes' if has_ts else 'no'}")
 
-        # ── 2. Target ─────────────────────────────────────────────────────────
-        print("\n[2/6] Creating target column …")
+        # 2. Target
+        print("\n[2/6] Creating target column ...")
         df["result"] = df.apply(get_result, axis=1)
         print(df["result"].value_counts().to_string())
 
-        # ── 3. Encode ─────────────────────────────────────────────────────────
-        print("\n[3/6] Encoding categorical features …")
+        # 3. Encode
+        print("\n[3/6] Encoding categorical features ...")
         home_enc  = LabelEncoder()
         away_enc  = LabelEncoder()
         tourn_enc = LabelEncoder()
         df["home_team_encoded"]  = home_enc.fit_transform(df["home_team"])
         df["away_team_encoded"]  = away_enc.fit_transform(df["away_team"])
         df["tournament_encoded"] = tourn_enc.fit_transform(df["tournament"])
-        encoders = {"home_team": home_enc, "away_team": away_enc, "tournament": tourn_enc}
+        encoders = {
+            "home_team":  home_enc,
+            "away_team":  away_enc,
+            "tournament": tourn_enc,
+        }
 
-        # ── 4. Split ──────────────────────────────────────────────────────────
-        print("\n[4/6] Splitting data …")
+        # 4. Split
+        print("\n[4/6] Splitting data ...")
         feature_cols = [c for c in (ALL_FEATURES if has_ts else BASE_FEATURES)
                         if c in df.columns]
 
@@ -124,9 +124,10 @@ def main():
         test_df = df.iloc[split_idx:].copy()
         os.makedirs(os.path.dirname(args.test_snap) or ".", exist_ok=True)
         test_df.to_csv(args.test_snap, index=False)
+        print(f"  Test snapshot saved -> {args.test_snap}")
 
-        # ── 5. Train ──────────────────────────────────────────────────────────
-        print(f"\n[5/6] Training LightGBM classifier (AutoML winner) …")
+        # 5. Train
+        print(f"\n[5/6] Training LightGBM classifier (AutoML winner) ...")
         from sklearn.model_selection import train_test_split as tts
 
         le       = LabelEncoder()
@@ -145,7 +146,6 @@ def main():
             colsample_bytree=0.8,
         )
 
-        # Find best draw threshold on validation split
         X_tr, X_val, y_tr, y_val = tts(
             X_train, y_tr_enc, test_size=0.15, random_state=args.random_state
         )
@@ -174,25 +174,24 @@ def main():
 
         print(f"  Best draw threshold: {best_thresh:.2f}  (val macro-F1={best_f1:.4f})")
 
-        # Retrain on full training set
         model.fit(X_train, y_tr_enc)
         model.str_classes_ = le.classes_
 
-        preds = predict_with_threshold(model.predict_proba(X_test), best_thresh)
-        acc   = accuracy_score(y_test, preds)
+        preds    = predict_with_threshold(model.predict_proba(X_test), best_thresh)
+        acc      = accuracy_score(y_test, preds)
         macro_f1 = f1_score(y_test, preds, average="macro", zero_division=0)
 
-        print(f"\n  Accuracy : {acc:.4f}")
+        print(f"\n  Accuracy  : {acc:.4f}")
+        print(f"  Macro F1  : {macro_f1:.4f}")
         print(classification_report(y_test, preds))
 
-        # Feature importance
         if has_ts:
             importances = pd.Series(model.feature_importances_, index=feature_cols)
-            print("  Top 10 most important features:")
+            print("  Top 10 features:")
             for feat, imp in importances.nlargest(10).items():
                 print(f"    {feat:<35s}  {imp:.4f}")
 
-        # ── MLflow logging ────────────────────────────────────────────────────
+        # MLflow logging
         mlflow.log_params({
             "model_type":       "LightGBM",
             "n_estimators":     args.n_estimators,
@@ -203,15 +202,15 @@ def main():
             "train_rows":       len(X_train),
             "test_rows":        len(X_test),
             "time_based_split": True,
-            "automl_winner":    "LightGBM (PyCaret)",
+            "automl_winner":    "LightGBM (PyCaret, sorted by Accuracy)",
+            "sort_metric":      "accuracy",
         })
         mlflow.log_metrics({
-            "accuracy":         round(acc, 4),
-            "macro_f1":         round(macro_f1, 4),
-            "val_macro_f1":     round(best_f1, 4),
+            "accuracy":     round(acc,      4),
+            "macro_f1":     round(macro_f1, 4),
+            "val_macro_f1": round(best_f1,  4),
         })
 
-        # Log per-class metrics
         report = classification_report(y_test, preds, output_dict=True, zero_division=0)
         for cls in ["Away Win", "Draw", "Home Win"]:
             safe = cls.lower().replace(" ", "_")
@@ -228,21 +227,22 @@ def main():
             "features":  "time_series + encoded",
         })
 
-        # ── 6. Save ───────────────────────────────────────────────────────────
-        print("\n[6/6] Saving artefacts …")
+        # 6. Save
+        print("\n[6/6] Saving artefacts ...")
         os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
         joblib.dump(model,        args.output)
         joblib.dump(encoders,     args.encoders)
         joblib.dump(feature_cols, "models/feature_cols.pkl")
         joblib.dump(best_thresh,  "models/draw_threshold.pkl")
         joblib.dump(le,           "models/target_encoder.pkl")
+        joblib.dump("lgbm",       "models/model_type.pkl")
 
         mlflow.log_artifact(args.output)
         mlflow.log_artifact("models/feature_cols.pkl")
 
-        print(f"  Model    → {args.output}")
-        print(f"  Encoders → {args.encoders}")
-        print("\n✅  Training complete. Run 'mlflow ui' to view experiment.")
+        print(f"  Model    -> {args.output}")
+        print(f"  Encoders -> {args.encoders}")
+        print("\nTraining complete. Run 'mlflow ui' to view experiment.")
 
 
 if __name__ == "__main__":

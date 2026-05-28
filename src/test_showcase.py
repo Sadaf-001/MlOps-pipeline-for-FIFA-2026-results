@@ -33,7 +33,7 @@ from sklearn.metrics import (
 )
 
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
+# --- Helpers ------------------------------------------------------------------
 
 FEATURE_COLS = [
     "home_team_encoded", "away_team_encoded", "tournament_encoded", "neutral"
@@ -58,7 +58,7 @@ def per_class_table(base_rep: dict, ft_rep: dict) -> str:
     lines = [
         f"\n  {'Class':<12}  {'Base P':>8}  {'FT P':>8}  {'Base R':>8}  "
         f"{'FT R':>8}  {'Base F1':>8}  {'FT F1':>8}",
-        "  " + "─" * 72,
+        "  " + "-" * 72,
     ]
     for cls in LABELS:
         b = base_rep.get(cls, {})
@@ -72,7 +72,7 @@ def per_class_table(base_rep: dict, ft_rep: dict) -> str:
     return "\n".join(lines)
 
 
-# ─── CLI ──────────────────────────────────────────────────────────────────────
+# --- CLI ----------------------------------------------------------------------
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -88,7 +88,7 @@ def parse_args():
     return p.parse_args()
 
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
+# --- Main ---------------------------------------------------------------------
 
 def get_classes(model):
     """Get string class labels — handles both sklearn and LightGBM models."""
@@ -104,8 +104,8 @@ def get_classes(model):
 def main():
     args = parse_args()
 
-    # ── Load ──────────────────────────────────────────────────────────────────
-    print("\n[1/4] Loading artefacts …")
+    # -- Load ------------------------------------------------------------------
+    print("\n[1/4] Loading artefacts ...")
     base_model   = joblib.load(args.base_model)
     encoders     = joblib.load(args.encoders)
     feature_cols = joblib.load(args.feature_cols) if os.path.exists(args.feature_cols) else None
@@ -118,13 +118,13 @@ def main():
     ft_available = os.path.exists(args.ft_model)
     if ft_available:
         ft_model = joblib.load(args.ft_model)
-        print(f"  ✅  Fine-tuned model loaded from '{args.ft_model}'")
+        print(f"  [OK]  Fine-tuned model loaded from '{args.ft_model}'")
     else:
         ft_model = None
-        print(f"  ⚠️   Fine-tuned model not found at '{args.ft_model}'. "
+        print(f"  [WARN]   Fine-tuned model not found at '{args.ft_model}'. "
               "Run fine_tune.py first for a full comparison.")
 
-    print("\n[2/4] Loading test snapshot …")
+    print("\n[2/4] Loading test snapshot ...")
     df = pd.read_csv(args.test_snap)
     cols = feature_cols if feature_cols else FEATURE_COLS
     # Only keep cols that exist in the snapshot
@@ -133,34 +133,33 @@ def main():
     y  = df["result"]
     print(f"  {len(df)} test rows | classes: {y.value_counts().to_dict()}")
 
-    # ── Predictions ───────────────────────────────────────────────────────────
-    print("\n[3/4] Running predictions …")
+    # -- Predictions -----------------------------------------------------------
+    print("\n[3/4] Running predictions ...")
     # Load target encoder to decode LightGBM numeric predictions
     target_enc_path = "models/target_encoder.pkl"
     target_enc = joblib.load(target_enc_path) if os.path.exists(target_enc_path) else None
 
     def get_str_classes(model):
+        if hasattr(model, 'str_classes_'):
+            return list(model.str_classes_)
         classes = list(model.classes_)
         if all(isinstance(c, (int, float)) for c in classes):
-            return list(target_enc.classes_) if target_enc else ["Away Win", "Draw", "Home Win"]
-        return classes
-
-    def decode(model, raw):
-        str_cls = get_classes(model)
-        classes = list(model.classes_)
-        if all(isinstance(c, (int, float)) for c in classes):
-            return [str_cls[int(p)] for p in raw]
-        return [str(p) for p in raw]
+            return ["Away Win", "Draw", "Home Win"]
+        return [str(c) for c in classes]
 
     def predict(model, X, thresh):
-        str_classes = get_classes(model)
+        str_classes = get_str_classes(model)
         draw_idx    = str_classes.index("Draw")
-        if thresh is None or thresh == 0:
-            return decode(model, model.predict(X))
-        proba = model.predict_proba(X)
+
+        # Use predict_proba if available (LR, LightGBM), else predict
+        if hasattr(model, 'predict_proba'):
+            scores = model.predict_proba(X)
+        else:
+            return [str(p) for p in model.predict(X)]
+
         preds = []
-        for row in proba:
-            if row[draw_idx] >= thresh:
+        for row in scores:
+            if thresh is not None and row[draw_idx] >= thresh:
                 preds.append("Draw")
             else:
                 idx = max((v, i) for i, v in enumerate(row) if i != draw_idx)[1]
@@ -185,8 +184,8 @@ def main():
         ft_rep   = {}
         ft_cm    = None
 
-    # ── Per-match sample table ─────────────────────────────────────────────────
-    print("\n[4/4] Building showcase …")
+    # -- Per-match sample table -------------------------------------------------
+    print("\n[4/4] Building showcase ...")
 
     sample = df[["home_team", "away_team", "result"]].copy().head(args.n_sample)
     sample["base_pred"] = base_preds[: args.n_sample]
@@ -195,17 +194,17 @@ def main():
         sample["ft_pred"] = ft_preds[: args.n_sample]
         sample["ft_correct"] = sample["result"] == sample["ft_pred"]
 
-    print("\n" + "═" * 80)
+    print("\n" + "=" * 80)
     print("  PER-MATCH SHOWCASE (first {} rows)".format(args.n_sample))
-    print("═" * 80)
+    print("=" * 80)
     col_w = [20, 20, 12, 14, 10]
-    hdr_cols = ["Home Team", "Away Team", "True Result", "Base Pred", "Base ✓"]
+    hdr_cols = ["Home Team", "Away Team", "True Result", "Base Pred", "Base OK"]
     if ft_model:
         col_w += [14, 10]
-        hdr_cols += ["FT Pred", "FT ✓"]
+        hdr_cols += ["FT Pred", "FT OK"]
     header = "  " + "".join(f"{h:<{w}}" for h, w in zip(hdr_cols, col_w))
     print(header)
-    print("  " + "─" * (sum(col_w)))
+    print("  " + "-" * (sum(col_w)))
 
     for _, row in sample.iterrows():
         vals = [
@@ -213,37 +212,37 @@ def main():
             str(row["away_team"])[:18],
             row["result"],
             row["base_pred"],
-            "✓" if row["base_correct"] else "✗",
+            "OK" if row["base_correct"] else "X",
         ]
         if ft_model:
-            vals += [row["ft_pred"], "✓" if row["ft_correct"] else "✗"]
+            vals += [row["ft_pred"], "OK" if row["ft_correct"] else "X"]
         print("  " + "".join(f"{v:<{w}}" for v, w in zip(vals, col_w)))
 
-    # ── Accuracy comparison ────────────────────────────────────────────────────
-    print("\n" + "═" * 80)
+    # -- Accuracy comparison ----------------------------------------------------
+    print("\n" + "=" * 80)
     print("  OVERALL ACCURACY")
-    print("═" * 80)
+    print("=" * 80)
     print(f"  Base model      : {fmt_pct(base_acc)}")
     if ft_model:
         delta = ft_acc - base_acc
         sign  = "+" if delta >= 0 else ""
         print(f"  Fine-tuned model: {fmt_pct(ft_acc)}   ({sign}{fmt_pct(delta)})")
 
-    # ── Per-class comparison ──────────────────────────────────────────────────
-    print("\n" + "═" * 80)
+    # -- Per-class comparison --------------------------------------------------
+    print("\n" + "=" * 80)
     print("  PER-CLASS METRICS (Precision / Recall / F1)")
-    print("═" * 80)
+    print("=" * 80)
     print(per_class_table(base_rep, ft_rep if ft_model else {}))
 
-    # ── Confusion matrices ────────────────────────────────────────────────────
-    print("\n" + "═" * 80)
+    # -- Confusion matrices ----------------------------------------------------
+    print("\n" + "=" * 80)
     print("  CONFUSION MATRICES")
-    print("═" * 80)
+    print("=" * 80)
     print_confusion(base_cm, "Base Model")
     if ft_cm is not None:
         print_confusion(ft_cm, "Fine-Tuned Model")
 
-    # ── Save report ───────────────────────────────────────────────────────────
+    # -- Save report -----------------------------------------------------------
     report = {
         "timestamp":    datetime.utcnow().isoformat(),
         "n_test_rows":  len(df),
@@ -265,8 +264,8 @@ def main():
     os.makedirs(os.path.dirname(args.report) or ".", exist_ok=True)
     with open(args.report, "w") as f:
         json.dump(report, f, indent=2)
-    print(f"\n  Report saved → {args.report}")
-    print("\n✅  Showcase complete.")
+    print(f"\n  Report saved -> {args.report}")
+    print("\n[OK]  Showcase complete.")
 
 
 if __name__ == "__main__":
