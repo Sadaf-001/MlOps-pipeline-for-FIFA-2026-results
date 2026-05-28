@@ -254,6 +254,7 @@
       </div>
     </div>
     <button class="predict-btn" onclick="runPrediction()">Predict result →</button>
+    <div id="api-status" style="font-size:12px;color:var(--muted);margin-top:10px">🟡 Checking server…</div>
 
     <div class="result-card" id="result-card">
       <div class="result-matchup" id="result-matchup"></div>
@@ -437,34 +438,83 @@ TEAMS.forEach((t,i) => {
 const ELO = {"Argentina":1850,"Brazil":1820,"France":1800,"England":1780,"Germany":1760,"Spain":1770,"Portugal":1750,"Netherlands":1740,"Belgium":1710,"Italy":1700,"Croatia":1680,"Uruguay":1660,"Colombia":1640,"Mexico":1620,"USA":1600,"Morocco":1580,"Senegal":1560,"Japan":1550,"South Korea":1530,"Australia":1510,"Denmark":1680,"Switzerland":1660,"Poland":1620,"Serbia":1610};
 function getElo(t){ return ELO[t]||1480; }
 
-function runPrediction(){
+const API = 'http://localhost:8000';
+let apiAvailable = false;
+
+async function checkApi(){
+  try {
+    const r = await fetch(API+'/health', {signal: AbortSignal.timeout(1500)});
+    apiAvailable = r.ok;
+  } catch { apiAvailable = false; }
+  document.getElementById('api-status').textContent = apiAvailable
+    ? '🟢 Live model connected' : '🟡 Simulated mode (start api.py for live predictions)';
+}
+checkApi();
+
+function eloFallback(home, away, neutral){
+  const ELO2 = {"Argentina":1850,"Brazil":1820,"France":1800,"England":1780,"Germany":1760,"Spain":1770,"Portugal":1750,"Netherlands":1740,"Belgium":1710,"Italy":1700,"Croatia":1680,"Uruguay":1660,"Colombia":1640,"Mexico":1620,"USA":1600,"Morocco":1580,"Senegal":1560,"Japan":1550,"South Korea":1530,"Australia":1510,"Denmark":1680,"Switzerland":1660,"Poland":1620,"Serbia":1610};
+  const eH = ELO2[home]||1480, eA = ELO2[away]||1480;
+  const diff = eH-eA+(neutral==='true'?0:55);
+  const winP = 1/(1+Math.pow(10,-diff/400));
+  const drawBase = 0.27;
+  let pH=winP*(1-drawBase), pD=drawBase, pA=(1-winP)*(1-drawBase);
+  const tot=pH+pD+pA; pH/=tot; pD/=tot; pA/=tot;
+  return {homeWin:pH, draw:pD, awayWin:pA};
+}
+
+async function runPrediction(){
   const home = homeEl.value, away = awayEl.value;
   if(home===away){ alert('Teams must be different.'); return; }
   const neutral = document.getElementById('neutral').value;
   const tournament = document.getElementById('tournament').value;
-  const eH = getElo(home), eA = getElo(away);
-  const diff = eH - eA + (neutral==='true' ? 0 : 55);
-  const winP = 1/(1+Math.pow(10,-diff/400));
-  const drawBase = 0.27;
-  let pH = winP*(1-drawBase), pD = drawBase, pA = (1-winP)*(1-drawBase);
-  const tot = pH+pD+pA; pH/=tot; pD/=tot; pA/=tot;
+  const btn = document.querySelector('.predict-btn');
+  btn.textContent = 'Predicting…'; btn.disabled = true;
 
-  let verdict, cls;
-  if(pH>=pA && pH>=pD){ verdict=home+' win'; cls='home'; }
-  else if(pA>=pH && pA>=pD){ verdict=away+' win'; cls='away'; }
-  else { verdict='Draw'; cls='draw'; }
+  let verdict, cls, probs, source;
 
-  document.getElementById('result-matchup').textContent = home+' vs '+away+' · '+tournament;
+  try {
+    if(!apiAvailable) throw new Error('API not available');
+    const res = await fetch(API+'/predict', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({home_team:home, away_team:away,
+                            tournament:tournament, neutral:neutral==='true'}),
+      signal: AbortSignal.timeout(5000)
+    });
+    if(!res.ok) throw new Error('API error');
+    const data = await res.json();
+    verdict = data.prediction;
+    probs = data.probability;
+    source = 'live';
+  } catch {
+    const fb = eloFallback(home, away, neutral);
+    probs = {'Home Win': fb.homeWin, 'Draw': fb.draw, 'Away Win': fb.awayWin};
+    if(fb.homeWin>=fb.awayWin && fb.homeWin>=fb.draw) verdict=home+' win';
+    else if(fb.awayWin>=fb.homeWin && fb.awayWin>=fb.draw) verdict=away+' win';
+    else verdict='Draw';
+    source = 'simulated';
+  }
+
+  if(verdict==='Home Win') { verdict=home+' win'; cls='home'; }
+  else if(verdict==='Away Win') { verdict=away+' win'; cls='away'; }
+  else cls='draw';
+
+  btn.textContent = 'Predict result →'; btn.disabled = false;
+  document.getElementById('result-matchup').textContent =
+    home+' vs '+away+' · '+tournament+(source==='live' ? ' · 🟢 live model' : ' · 🟡 simulated');
   const rv = document.getElementById('result-verdict');
   rv.textContent = verdict; rv.className = 'result-verdict '+cls;
   document.getElementById('hw-label').textContent = home+' win';
   document.getElementById('aw-label').textContent = away+' win';
-  const p = [Math.round(pH*100), Math.round(pD*100), Math.round(pA*100)];
-  ['hw','dr','aw'].forEach((id,i)=>{
-    document.getElementById(id+'-pct').textContent = p[i]+'%';
-    document.getElementById(id+'-bar').style.width = p[i]+'%';
+  const hw=Math.round((probs['Home Win']||0)*100);
+  const dr=Math.round((probs['Draw']||0)*100);
+  const aw=Math.round((probs['Away Win']||0)*100);
+  ['hw','dr','aw'].forEach((id,val)=>{
+    const v=[hw,dr,aw][val];
+    document.getElementById(id+'-pct').textContent=v+'%';
+    document.getElementById(id+'-bar').style.width=v+'%';
   });
-  document.getElementById('result-card').className = 'result-card show';
+  document.getElementById('result-card').className='result-card show';
 }
 
 function switchTab(id){
