@@ -1,14 +1,14 @@
 """
-fine_tune.py  (v3 — LightGBM compatible)
-=========================================
-Fine-tune a previously saved FIFA match prediction model on new data.
+fine_tune.py  (v4 — LightGBM + MLflow tracking)
+=================================================
+Fine-tune the FIFA match prediction model on new data.
+All runs tracked with MLflow.
 
 Usage:
     python src/fine_tune.py \
         --new-data  data/results_engineered.csv \
         --base-model models/fifa_model.pkl \
-        --encoders   models/encoders.pkl \
-        --output     models/fifa_model_finetuned.pkl
+        --encoders   models/encoders.pkl
 """
 
 import argparse
@@ -17,9 +17,9 @@ import os
 from datetime import datetime
 
 import joblib
+import mlflow
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.metrics import accuracy_score, classification_report, f1_score
 from sklearn.model_selection import train_test_split
 
 
@@ -33,13 +33,13 @@ def get_result(row) -> str:
     return "Draw"
 
 
-def load_encoders(path: str) -> dict:
+def load_encoders(path):
     if not os.path.exists(path):
         raise FileNotFoundError(f"Encoders not found at '{path}'. Run train.py first.")
     return joblib.load(path)
 
 
-def encode_new_data(df: pd.DataFrame, encoders: dict) -> pd.DataFrame:
+def encode_new_data(df, encoders):
     df = df.copy()
     for col, key in [("home_team", "home_team"), ("away_team", "away_team"),
                      ("tournament", "tournament")]:
@@ -51,15 +51,7 @@ def encode_new_data(df: pd.DataFrame, encoders: dict) -> pd.DataFrame:
     return df
 
 
-def prepare_features(df: pd.DataFrame, feature_cols: list) -> tuple:
-    missing = [c for c in feature_cols if c not in df.columns]
-    if missing:
-        raise ValueError(f"Dataset missing {len(missing)} feature columns: {missing}")
-    return df[feature_cols], df["result"]
-
-
 def get_classes(model):
-    """Get string class labels — handles both sklearn and LightGBM models."""
     if hasattr(model, 'str_classes_'):
         return list(model.str_classes_)
     classes = list(model.classes_)
@@ -68,8 +60,7 @@ def get_classes(model):
     return classes
 
 
-def evaluate(model, X_test, y_test, label: str,
-             draw_threshold: float = None) -> dict:
+def evaluate(model, X_test, y_test, label, draw_threshold=None):
     str_classes = get_classes(model)
     draw_idx    = str_classes.index("Draw")
 
@@ -93,40 +84,12 @@ def evaluate(model, X_test, y_test, label: str,
 
     y_str  = [str(v) for v in y_test]
     acc    = accuracy_score(y_str, preds)
+    mf1    = f1_score(y_str, preds, average="macro", zero_division=0)
     report = classification_report(y_str, preds, output_dict=True, zero_division=0)
     print(f"\n── {label} ──")
     print(f"  Accuracy : {acc:.4f}")
     print(classification_report(y_str, preds, zero_division=0))
-    return {"accuracy": acc, "report": report}
-
-
-def warm_start_finetune(base_model, X_new, y_new, n_new_estimators=50):
-    """Add new trees to existing forest via warm-start."""
-    # Only works for RandomForest — for LightGBM we retrain
-    if not isinstance(base_model, RandomForestClassifier):
-        print("  ⚠️  Warm-start only supported for RandomForest.")
-        print("     For LightGBM, retraining on combined data instead.")
-        base_model.fit(X_new, y_new)
-        return base_model
-
-    base_n    = base_model.n_estimators
-    new_total = base_n + n_new_estimators
-
-    params = base_model.get_params()
-    params["n_estimators"] = base_n
-    params["warm_start"]   = True
-
-    fine_tuned = RandomForestClassifier(**params)
-    fine_tuned.estimators_    = base_model.estimators_
-    fine_tuned.classes_       = base_model.classes_
-    fine_tuned.n_classes_     = base_model.n_classes_
-    fine_tuned.n_outputs_     = base_model.n_outputs_
-    fine_tuned.n_features_in_ = base_model.n_features_in_
-    fine_tuned.set_params(n_estimators=new_total)
-    fine_tuned.fit(X_new, y_new)
-
-    print(f"  Base trees : {base_n}\n  New trees  : {n_new_estimators}\n  Total: {new_total}")
-    return fine_tuned
+    return {"accuracy": acc, "macro_f1": mf1, "report": report}
 
 
 def log_run(log_path, base_acc, ft_acc, n_new_rows, n_new_estimators, output_path):
@@ -164,58 +127,103 @@ def parse_args():
     p.add_argument("--n-estimators", type=int, default=50)
     p.add_argument("--test-size",    type=float, default=0.2)
     p.add_argument("--log",          default="logs/finetune_log.json")
+    p.add_argument("--experiment",   default="FIFA Match Prediction")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
 
-    print(f"\n[1/5] Loading artefacts …")
-    base_model   = joblib.load(args.base_model)
-    encoders     = load_encoders(args.encoders)
-    feature_cols = joblib.load(args.feature_cols) if os.path.exists(args.feature_cols) else None
-    draw_thresh  = joblib.load(args.draw_thresh)  if os.path.exists(args.draw_thresh)  else None
-    if feature_cols:
-        print(f"  Feature cols loaded: {len(feature_cols)} columns")
-    if draw_thresh:
-        print(f"  Draw threshold loaded: {draw_thresh:.2f}")
+    mlflow.set_experiment(args.experiment)
 
-    print(f"\n[2/5] Loading new data from '{args.new_data}' …")
-    df = pd.read_csv(args.new_data)
-    df["result"] = df.apply(get_result, axis=1)
-    if df["neutral"].dtype == object:
-        df["neutral"] = df["neutral"].str.upper().map({"TRUE": 1, "FALSE": 0})
-    df = encode_new_data(df, encoders)
-    print(f"  {len(df)} rows | {df['result'].value_counts().to_dict()}")
+    with mlflow.start_run(run_name="fine_tune"):
 
-    print("\n[3/5] Preparing features …")
-    if feature_cols is None:
-        feature_cols = ["home_team_encoded", "away_team_encoded",
-                        "tournament_encoded", "neutral"]
-    X, y = prepare_features(df, feature_cols)
+        print(f"\n[1/5] Loading artefacts …")
+        base_model   = joblib.load(args.base_model)
+        encoders     = load_encoders(args.encoders)
+        feature_cols = joblib.load(args.feature_cols) if os.path.exists(args.feature_cols) else None
+        draw_thresh  = joblib.load(args.draw_thresh)  if os.path.exists(args.draw_thresh)  else None
+        if feature_cols:
+            print(f"  Feature cols loaded: {len(feature_cols)} columns")
+        if draw_thresh:
+            print(f"  Draw threshold loaded: {draw_thresh:.2f}")
 
-    # Time-based split
-    if "date" in df.columns:
-        df = df.sort_values("date").reset_index(drop=True)
-        X, y = prepare_features(df, feature_cols)
-    split_idx = int(len(df) * (1 - args.test_size))
-    X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
-    y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+        print(f"\n[2/5] Loading new data from '{args.new_data}' …")
+        df = pd.read_csv(args.new_data)
+        df["result"] = df.apply(get_result, axis=1)
+        if df["neutral"].dtype == object:
+            df["neutral"] = df["neutral"].str.upper().map({"TRUE": 1, "FALSE": 0})
+        df = encode_new_data(df, encoders)
+        print(f"  {len(df)} rows | {df['result'].value_counts().to_dict()}")
 
-    print("\n[4/5] Evaluating base model on new test split …")
-    base_metrics = evaluate(base_model, X_test, y_test,
-                            "BASE MODEL", draw_threshold=draw_thresh)
+        print("\n[3/5] Preparing features …")
+        if feature_cols is None:
+            feature_cols = ["home_team_encoded", "away_team_encoded",
+                            "tournament_encoded", "neutral"]
 
-    print(f"\n[5/5] Fine-tuning (+{args.n_estimators} trees) …")
-    ft_model = warm_start_finetune(base_model, X_train, y_train, args.n_estimators)
-    ft_metrics = evaluate(ft_model, X_test, y_test,
-                          "FINE-TUNED MODEL", draw_threshold=draw_thresh)
+        if "date" in df.columns:
+            df = df.sort_values("date").reset_index(drop=True)
 
-    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
-    joblib.dump(ft_model, args.output)
-    print(f"\n  Fine-tuned model saved → {args.output}")
-    log_run(args.log, base_metrics["accuracy"], ft_metrics["accuracy"],
-            len(df), args.n_estimators, args.output)
+        X = df[feature_cols]
+        y = df["result"]
+        split_idx = int(len(df) * (1 - args.test_size))
+        X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
+        y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+
+        print("\n[4/5] Evaluating base model on new test split …")
+        base_metrics = evaluate(base_model, X_test, y_test,
+                                "BASE MODEL", draw_threshold=draw_thresh)
+
+        print(f"\n[5/5] Fine-tuning …")
+        from sklearn.ensemble import RandomForestClassifier
+        if isinstance(base_model, RandomForestClassifier):
+            base_n    = base_model.n_estimators
+            new_total = base_n + args.n_estimators
+            params = base_model.get_params()
+            params["n_estimators"] = base_n
+            params["warm_start"]   = True
+            from sklearn.ensemble import RandomForestClassifier as RFC
+            ft_model = RFC(**params)
+            ft_model.estimators_    = base_model.estimators_
+            ft_model.classes_       = base_model.classes_
+            ft_model.n_classes_     = base_model.n_classes_
+            ft_model.n_outputs_     = base_model.n_outputs_
+            ft_model.n_features_in_ = base_model.n_features_in_
+            ft_model.set_params(n_estimators=new_total)
+            ft_model.fit(X_train, y_train)
+            print(f"  Warm-start: {base_n} + {args.n_estimators} = {new_total} trees")
+        else:
+            print("  LightGBM: retraining on new data …")
+            ft_model = base_model
+            from sklearn.preprocessing import LabelEncoder
+            le = joblib.load("models/target_encoder.pkl") if os.path.exists("models/target_encoder.pkl") else LabelEncoder().fit(y_train)
+            y_enc = le.transform(y_train)
+            ft_model.fit(X_train, y_enc)
+
+        ft_metrics = evaluate(ft_model, X_test, y_test,
+                              "FINE-TUNED MODEL", draw_threshold=draw_thresh)
+
+        # MLflow logging
+        mlflow.log_params({
+            "n_new_rows":      len(df),
+            "n_new_estimators": args.n_estimators,
+            "draw_threshold":  draw_thresh,
+        })
+        mlflow.log_metrics({
+            "base_accuracy":      round(base_metrics["accuracy"], 4),
+            "finetuned_accuracy": round(ft_metrics["accuracy"],   4),
+            "delta":              round(ft_metrics["accuracy"] - base_metrics["accuracy"], 4),
+            "base_macro_f1":      round(base_metrics["macro_f1"], 4),
+            "finetuned_macro_f1": round(ft_metrics["macro_f1"],   4),
+        })
+
+        os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+        joblib.dump(ft_model, args.output)
+        mlflow.log_artifact(args.output)
+        print(f"\n  Fine-tuned model saved → {args.output}")
+
+        log_run(args.log, base_metrics["accuracy"], ft_metrics["accuracy"],
+                len(df), args.n_estimators, args.output)
 
 
 if __name__ == "__main__":
