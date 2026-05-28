@@ -352,11 +352,14 @@
 
   <!-- ══ MONITORING ══════════════════════════════════════════════════════════ -->
   <div class="panel" id="panel-monitoring">
-    <div class="slider-row">
-      <div class="slider-label">Drift intensity</div>
-      <input type="range" min="0" max="100" value="0" id="drift-slider" oninput="updateDrift(this.value)" step="1">
-      <div class="slider-val" id="drift-val">0%</div>
+    <div class="slider-row" style="flex-wrap:wrap;gap:12px">
+      <div class="slider-label">Swap feature values</div>
+      <select id="feat-a" style="flex:1;min-width:160px;background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:8px 10px;font-size:13px;font-family:var(--font-body)"></select>
+      <div style="font-family:var(--font-head);font-size:13px;font-weight:600;color:var(--muted);align-self:center">⇄</div>
+      <select id="feat-b" style="flex:1;min-width:160px;background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:8px 10px;font-size:13px;font-family:var(--font-body)"></select>
+      <button id="swap-btn" onclick="toggleSwap()" style="padding:8px 20px;font-family:var(--font-head);font-size:12px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;background:transparent;border:1px solid var(--green);color:var(--green);border-radius:6px;cursor:pointer;transition:all 0.15s;white-space:nowrap">Apply swap</button>
     </div>
+    <div id="swap-banner" style="display:none;background:rgba(245,200,66,0.08);border:1px solid rgba(245,200,66,0.25);border-radius:6px;padding:10px 14px;font-size:12px;color:#F5D97A;margin-bottom:16px"></div>
 
     <div class="metrics-grid">
       <div class="metric-card">
@@ -472,14 +475,51 @@ function switchTab(id){
 
 const FEATS = ['h2h_home_win_rate','home_goals_conceded_avg','away_goals_conceded_avg','goals_diff','home_home_goals_avg','away_away_goals_avg','home_win_rate','away_win_rate','home_streak','away_streak','tournament_encoded','neutral','home_team_encoded','away_team_encoded'];
 
-function updateDrift(val){
-  val = parseInt(val);
-  document.getElementById('drift-val').textContent = val+'%';
+const ALL_FEATS = ['h2h_home_win_rate','home_goals_conceded_avg','away_goals_conceded_avg','goals_diff','home_home_goals_avg','away_away_goals_avg','home_win_rate','away_win_rate','home_streak','away_streak','home_goals_scored_avg','away_goals_scored_avg','home_draw_rate','away_draw_rate','home_loss_rate','away_loss_rate','home_home_goals_avg','away_away_goals_avg','win_rate_diff','streak_diff','tournament_encoded','neutral','home_team_encoded','away_team_encoded'];
+
+const faEl = document.getElementById('feat-a');
+const fbEl = document.getElementById('feat-b');
+ALL_FEATS.forEach((f,i) => {
+  const a = new Option(f,f); if(i===6) a.selected=true;
+  const b = new Option(f,f); if(i===7) b.selected=true;
+  faEl.add(a); fbEl.add(b);
+});
+
+let swapActive = false;
+
+function toggleSwap(){
+  const btn = document.getElementById('swap-btn');
+  const banner = document.getElementById('swap-banner');
+  const fa = faEl.value, fb = fbEl.value;
+  if(fa === fb){ alert('Please select two different features.'); return; }
+  swapActive = !swapActive;
+  if(swapActive){
+    btn.textContent = 'Undo swap';
+    btn.style.background = 'var(--gold)';
+    btn.style.color = '#000';
+    btn.style.borderColor = 'var(--gold)';
+    banner.style.display = 'block';
+    banner.textContent = '⚡ Swapped "'+fa+'" ↔ "'+fb+'" — simulates a distribution shift in these features across the test set';
+    faEl.disabled = fbEl.disabled = true;
+    updateDrift(70, fa, fb);
+  } else {
+    btn.textContent = 'Apply swap';
+    btn.style.background = 'transparent';
+    btn.style.color = 'var(--green)';
+    btn.style.borderColor = 'var(--green)';
+    banner.style.display = 'none';
+    faEl.disabled = fbEl.disabled = false;
+    updateDrift(0, fa, fb);
+  }
+}
+
+function updateDrift(val, featA, featB){
   const drop = +(val*0.085).toFixed(1);
   const acc  = +(51.2-drop).toFixed(1);
-  const drifted = Math.round(val/14);
-  const chiDrift = val > 20;
-  const chiP = chiDrift ? (0.001+(100-val)*0.0008).toFixed(3) : (0.1+(100-val)*0.009).toFixed(2);
+  const swappedFeats = swapActive && featA && featB ? [featA, featB] : [];
+  const drifted = swappedFeats.length;
+  const chiDrift = swapActive && (featA||'').includes('win_rate') || (featA||'').includes('goals');
+  const chiP = chiDrift ? '0.018' : '0.64';
 
   const dEl = document.getElementById('d-acc');
   dEl.textContent = acc+'%';
@@ -506,14 +546,14 @@ function updateDrift(val){
   document.getElementById('dr-cur-bar').style.width = dr+'%';
   document.getElementById('aw-cur-bar').style.width = aw+'%';
 
-  document.getElementById('drift-table').innerHTML = FEATS.map((f,i)=>{
-    const isDrift = i<drifted;
-    const ks = isDrift?(0.12+i*0.04+val*0.002).toFixed(4):(0.0001+i*0.0001).toFixed(4);
-    const p  = isDrift?(0.001+i*0.01).toFixed(3):(0.5+i*0.05).toFixed(2);
-    const cls = isDrift?(i<2?'dot-bad':'dot-warn'):'dot-ok';
-    const scol = isDrift?(i<2?'var(--red)':'var(--gold)'):'var(--green)';
+  document.getElementById('drift-table').innerHTML = ALL_FEATS.slice(0,14).map((f,i)=>{
+    const isDrift = swapActive && (f === (featA||'') || f === (featB||''));
+    const ks = isDrift?'0.2841':'0.0000';
+    const p  = isDrift?'0.001':'0.99';
+    const cls = isDrift?'dot-bad':'dot-ok';
+    const scol = isDrift?'var(--red)':'var(--green)';
     return `<div class="drift-row"><div class="dot ${cls}"></div><div class="drift-feat">${f}</div><div class="drift-stat">KS=${ks}</div><div class="drift-stat">p=${p}</div><div class="drift-status" style="color:${scol}">${isDrift?'DRIFTED':'stable'}</div></div>`;
-  }).join('');
+  }).join('') + `<div style="font-size:11px;color:var(--muted);padding:8px 16px">${ALL_FEATS.length-14} more features — all stable</div>`;
 
   const alerts = [];
   if(drifted>3) alerts.push(['bad','Feature drift in '+drifted+' features — recommend fine-tuning on recent data']);
@@ -526,7 +566,7 @@ function updateDrift(val){
   else alerts.push(['ok','Accuracy within acceptable range']);
   document.getElementById('drift-alerts').innerHTML = alerts.map(([t,m])=>`<div class="alert alert-${t}"><span class="alert-icon">${t==='ok'?'✓':t==='warn'?'⚡':'⚠'}</span>${m}</div>`).join('');
 }
-updateDrift(0);
+updateDrift(0, null, null);
 </script>
 </body>
 </html>
